@@ -60,21 +60,54 @@ def retry_manual(anterior, atual, gap_auto):
     return u_ant is not None and u_atu is not None and u_ant != u_atu
 
 
-def analisar_pipeline(jobs, deploy_jobs, rollback_re, gap_auto):
+class DeploySpec:
+    """Como identificar os jobs de deploy de um pipeline.
+
+    - nomes: lista exata; o deploy só é completo se TODOS tiverem sucesso.
+    - regex: qualquer job que case (re.search); completo quando ao menos
+      `min_jobs` deles tiveram sucesso e nenhum dos que rodaram falhou. Jobs
+      manuais nunca acionados (manual/skipped) são ignorados.
+    """
+
+    def __init__(self, nomes=None, regex=None, min_jobs=2):
+        self.nomes, self.regex, self.min_jobs = nomes or [], regex, min_jobs
+
+    def __str__(self):
+        if self.regex:
+            return f"/{self.regex.pattern}/ (mín. {self.min_jobs} jobs com sucesso)"
+        return " + ".join(self.nomes)
+
+    def alvo(self, nomes_no_pipeline, rollback_re):
+        if self.regex:
+            return [n for n in nomes_no_pipeline
+                    if self.regex.search(n) and not rollback_re.search(n)]
+        return [n for n in self.nomes if n in nomes_no_pipeline]
+
+    def completo(self, por_job, alvo):
+        if not self.regex:
+            return len(alvo) == len(self.nomes) and all(por_job[n][-1]["status"] == "success" for n in alvo)
+        ativos = [n for n in alvo if por_job[n][-1]["status"] not in ("manual", "skipped")]
+        return (len(ativos) >= self.min_jobs
+                and all(por_job[n][-1]["status"] == "success" for n in ativos))
+
+    def concluidos(self, por_job, alvo):
+        return [n for n in alvo if por_job[n][-1]["status"] == "success"]
+
+
+def analisar_pipeline(jobs, deploy, rollback_re, gap_auto):
     por_job = defaultdict(list)
     for j in jobs:
         por_job[j["name"]].append(j)
     for tentativas in por_job.values():
         tentativas.sort(key=lambda a: a["id"])
 
-    deploy_completo = all(
-        n in por_job and por_job[n][-1]["status"] == "success" for n in deploy_jobs
-    )
-    deploy_presente = any(n in por_job for n in deploy_jobs)
+    alvo = deploy.alvo(por_job.keys(), rollback_re)
+    deploy_completo = deploy.completo(por_job, alvo)
+    deploy_presente = bool(alvo)
 
     retries_manuais = retries_apos_sucesso = 0
-    for n in deploy_jobs:
-        t = por_job.get(n, [])
+    for n in alvo:  # retries são tentativas do mesmo nome de job
+        t = por_job[n]
         for ant, atu in zip(t, t[1:]):
             if retry_manual(ant, atu, gap_auto):
                 retries_manuais += 1
@@ -92,7 +125,8 @@ def analisar_pipeline(jobs, deploy_jobs, rollback_re, gap_auto):
 
     deploy_em = ""
     if deploy_completo:
-        fins = [parse_ts(por_job[n][-1].get("finished_at") or por_job[n][-1]["created_at"]) for n in deploy_jobs]
+        fins = [parse_ts(por_job[n][-1].get("finished_at") or por_job[n][-1]["created_at"])
+                for n in deploy.concluidos(por_job, alvo)]
         deploy_em = max(fins).isoformat()
 
     return {
@@ -254,7 +288,7 @@ def listar_projetos(gl, args):
     return [(p.id, p.path_with_namespace) for p in origem]
 
 
-def processar_projeto(gl, ref, path, args, deploy_jobs, rollback_re, gap_auto):
+def processar_projeto(gl, ref, path, args, deploy, rollback_re, gap_auto):
     """Nunca levanta exceção por problema de um projeto (só 401 aborta tudo).
 
     status: com_producao | sem_pipelines | sem_jobs_producao | sem_acesso | erro
@@ -305,7 +339,7 @@ def processar_projeto(gl, ref, path, args, deploy_jobs, rollback_re, gap_auto):
             for j in jobs:
                 if NOMES_RELEVANTES.search(j["name"]):
                     res["nomes"][j["name"]] += 1
-            a = analisar_pipeline(jobs, deploy_jobs, rollback_re, gap_auto)
+            a = analisar_pipeline(jobs, deploy, rollback_re, gap_auto)
             if not a["deploy_presente"] and a["rollback"] == "none":
                 continue  # pipeline sem relação com produção
             res["linhas"].append({
@@ -342,6 +376,12 @@ def main():
     ap.add_argument("--until", type=date.fromisoformat, default=date(2026, 9, 30))
     ap.add_argument("--deploy-jobs", default="deploy-prd-bc,deploy-prd-mt",
                     help="jobs que, juntos, definem um deploy completo (ativo-ativo)")
+    ap.add_argument("--deploy-regex",
+                    help="alternativa a --deploy-jobs: regex dos jobs de deploy (re.search), "
+                         "ex.: '^deploy[-_]prd'")
+    ap.add_argument("--deploy-min-jobs", type=int, default=2,
+                    help="com --deploy-regex: mínimo de jobs com sucesso para o deploy ser completo "
+                         "(2 = os dois clusters do ativo-ativo)")
     ap.add_argument("--rollback-regex", default=r"^rollback",
                     help="regex dos jobs de rollback (qualquer cluster conta como 1)")
     ap.add_argument("--ref", help="filtra por branch/tag (ex.: main)")
@@ -359,7 +399,10 @@ def main():
     if args.since > args.until:
         ap.error("--since não pode ser posterior a --until")
 
-    deploy_jobs = [j.strip() for j in args.deploy_jobs.split(",") if j.strip()]
+    if args.deploy_regex:
+        deploy = DeploySpec(regex=re.compile(args.deploy_regex), min_jobs=args.deploy_min_jobs)
+    else:
+        deploy = DeploySpec(nomes=[j.strip() for j in args.deploy_jobs.split(",") if j.strip()])
     rollback_re = re.compile(args.rollback_regex)
     gap_auto = timedelta(seconds=args.auto_retry_gap)
     if args.insecure:
@@ -386,7 +429,7 @@ def main():
     feitos = 0
     ex = ThreadPoolExecutor(max_workers=args.project_workers)
     try:
-        futuros = [ex.submit(processar_projeto, gl, ref, path, args, deploy_jobs, rollback_re, gap_auto)
+        futuros = [ex.submit(processar_projeto, gl, ref, path, args, deploy, rollback_re, gap_auto)
                    for ref, path in projetos]
         for fut in as_completed(futuros):
             try:
@@ -454,7 +497,7 @@ def main():
 
     t = meses["TOTAL"]  # defaultdict: zerado se não houve nada
     n = t["deploys_completos"]
-    print(f"\nPeríodo {args.since} a {args.until} | deploy completo = {' + '.join(deploy_jobs)}")
+    print(f"\nPeríodo {args.since} a {args.until} | deploy completo = {deploy}")
     print(f"Projetos: {len(projetos)} listados | {contagem['com_producao']} com deploy/rollback | "
           f"{contagem['sem_pipelines']} sem pipelines no período | "
           f"{contagem['sem_jobs_producao']} sem jobs de produção | "

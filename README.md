@@ -58,6 +58,18 @@ python deploy_metrics.py --project 123 \
   --rollback-regex '^(rollback|revert)-prd'
 ```
 
+### Regex em vez de nomes de job
+
+```bash
+python deploy_metrics.py --deploy-regex '^deploy[-_]prd' --rollback-regex '^rollback[-_]prd'
+```
+
+- O regex usa `re.search`; ancore com `^` para não casar nomes inesperados. `[-_]` cobre hífen e underscore.
+- **Retries são contados normalmente:** cada retry é uma nova tentativa do mesmo nome de job, então vale para qualquer job que o regex capture, inclusive nomes de `parallel:matrix` como `deploy_prd: [bc]`.
+- **Deploy completo com regex:** pelo menos `--deploy-min-jobs` jobs casados com sucesso na última tentativa e nenhum dos que rodaram falhou. Jobs manuais nunca acionados (`manual`/`skipped`, por exemplo um `deploy-prd-dr` opcional) são ignorados. Com `--deploy-min-jobs 1`, um deploy em um só cluster passa a contar como completo.
+- Jobs que casam com o regex de rollback nunca são tratados como deploy, mesmo que o nome também case com o regex de deploy.
+- `--deploy-regex` e `--deploy-jobs` não se combinam; o regex tem prioridade.
+
 ### GitLab com certificado autoassinado
 
 Duas opções:
@@ -86,6 +98,8 @@ export REQUESTS_CA_BUNDLE=/caminho/ca-interna.pem
 | `--all-activity` | desligado | Não filtra projetos por `last_activity_at >= --since` (mais lento, mais completo) |
 | `--since` / `--until` | `2026-01-01` / `2026-09-30` | Período, formato `AAAA-MM-DD`, inclusivo, pela data de **criação do pipeline** |
 | `--deploy-jobs` | `deploy-prd-bc,deploy-prd-mt` | Jobs que, juntos, definem um deploy completo |
+| `--deploy-regex` | (nenhum) | Alternativa a `--deploy-jobs`: regex dos jobs de deploy (`re.search`), ex.: `'^deploy[-_]prd'` |
+| `--deploy-min-jobs` | `2` | Com `--deploy-regex`: mínimo de jobs com sucesso para o deploy ser completo (2 = os dois clusters) |
 | `--rollback-regex` | `^rollback` | Regex dos jobs de rollback |
 | `--ref` | (todas) | Filtra por branch/tag |
 | `--auto-retry-gap` | `60` | Segundos; retry mais rápido que isso é tratado como automático |
