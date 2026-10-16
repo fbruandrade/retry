@@ -1,1 +1,2 @@
 python-gitlab>=4.0
+requests

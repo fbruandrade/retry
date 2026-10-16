@@ -14,6 +14,8 @@ resumo no terminal.
 
 Uso:
   export GITLAB_URL=https://gitlab.exemplo.com GITLAB_TOKEN=glpat-xxx   # read_api
+  python deploy_metrics.py                       # varre TODOS os projetos
+  python deploy_metrics.py --group meu-grupo     # só um grupo (com subgrupos)
   python deploy_metrics.py --project 123 --project grupo/outro-projeto
   # GitLab com certificado autoassinado: acrescente --insecure (ou GITLAB_INSECURE=1)
 """
@@ -22,11 +24,12 @@ import csv
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 import gitlab
+import requests
 
 
 # --------------------------------------------------------------------------
@@ -129,42 +132,103 @@ def pct(a, b):
     return f"{100 * a / b:.1f}" if b else "0.0"
 
 
+
 # --------------------------------------------------------------------------
 # Coleta no GitLab
 # --------------------------------------------------------------------------
+CAMPOS_PIPELINE = [
+    "projeto", "pipeline_id", "url", "ref", "criado_em", "mes",
+    "deploy_presente", "deploy_completo", "entrega",
+    "retries_manuais", "retries_apos_sucesso", "rollback",
+]
+NOMES_RELEVANTES = re.compile(r"deploy|rollback|revert", re.I)
+
+
+def motivo(e):
+    code = getattr(e, "response_code", None)
+    msg = str(getattr(e, "error_message", "") or e)[:200]
+    return f"HTTP {code}: {msg}" if code else msg
+
+
 def coletar_jobs(project, pipeline_id):
     pl = project.pipelines.get(pipeline_id, lazy=True)
     return [j.attributes for j in pl.jobs.list(include_retried=True, per_page=100, iterator=True)]
 
 
-def processar_projeto(gl, ref_projeto, args, deploy_jobs, rollback_re, gap_auto):
-    project = gl.projects.get(ref_projeto)
-    filtros = dict(
-        created_after=f"{args.since}T00:00:00Z",
-        created_before=f"{args.until + timedelta(days=1)}T00:00:00Z",
-        per_page=100,
-        iterator=True,
-    )
-    if args.ref:
-        filtros["ref"] = args.ref
-    pipelines = [p.attributes for p in project.pipelines.list(**filtros)]
-    print(f"[{project.path_with_namespace}] {len(pipelines)} pipelines no período", file=sys.stderr)
+def listar_projetos(gl, args):
+    """Retorna [(id_ou_path, path|None)]. Sem --project, varre o GitLab todo."""
+    if args.project:
+        return [(ref, None) for ref in args.project]
+    filtros = dict(iterator=True, per_page=100, simple=True, order_by="id", sort="asc")
+    if not args.include_archived:
+        filtros["archived"] = False
+    if args.membership:
+        filtros["membership"] = True
+    if args.group:
+        origem = gl.groups.get(args.group).projects.list(include_subgroups=True, **filtros)
+    else:
+        if not args.all_activity:
+            filtros["last_activity_after"] = f"{args.since}T00:00:00Z"
+        origem = gl.projects.list(**filtros)
+    return [(p.id, p.path_with_namespace) for p in origem]
 
-    linhas, erros = [], []
+
+def processar_projeto(gl, ref, path, args, deploy_jobs, rollback_re, gap_auto):
+    """Nunca levanta exceção por problema de um projeto (só 401 aborta tudo).
+
+    status: com_producao | sem_pipelines | sem_jobs_producao | sem_acesso | erro
+    """
+    res = {"path": path or str(ref), "status": "", "linhas": [], "erros": [], "nomes": Counter()}
+    try:
+        if path is None:
+            project = gl.projects.get(ref)
+            res["path"] = path = project.path_with_namespace
+        else:
+            project = gl.projects.get(ref, lazy=True)
+        filtros = dict(
+            created_after=f"{args.since}T00:00:00Z",
+            created_before=f"{args.until + timedelta(days=1)}T00:00:00Z",
+            per_page=100,
+            iterator=True,
+        )
+        if args.ref:
+            filtros["ref"] = args.ref
+        pipelines = [p.attributes for p in project.pipelines.list(**filtros)]
+    except gitlab.exceptions.GitlabAuthenticationError:
+        raise
+    except gitlab.exceptions.GitlabError as e:
+        # 403/404: sem permissão, projeto inexistente ou CI/Pipelines desabilitado
+        res["status"] = "sem_acesso" if getattr(e, "response_code", None) in (403, 404) else "erro"
+        res["erros"].append((res["path"], "", motivo(e)))
+        return res
+    except requests.exceptions.RequestException as e:
+        res["status"] = "erro"
+        res["erros"].append((res["path"], "", f"rede: {e}"[:200]))
+        return res
+
+    if not pipelines:
+        res["status"] = "sem_pipelines"
+        return res
+
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futuros = {ex.submit(coletar_jobs, project, p["id"]): p for p in pipelines}
-        for i, fut in enumerate(as_completed(futuros), 1):
+        for fut in as_completed(futuros):
             p = futuros[fut]
             try:
                 jobs = fut.result()
-            except Exception as e:  # segue adiante, reporta no final
-                erros.append((project.path_with_namespace, p["id"], str(e)))
+            except gitlab.exceptions.GitlabAuthenticationError:
+                raise
+            except Exception as e:  # pipeline sem jobs acessíveis, apagado etc.
+                res["erros"].append((path, p["id"], motivo(e)))
                 continue
+            for j in jobs:
+                if NOMES_RELEVANTES.search(j["name"]):
+                    res["nomes"][j["name"]] += 1
             a = analisar_pipeline(jobs, deploy_jobs, rollback_re, gap_auto)
             if not a["deploy_presente"] and a["rollback"] == "none":
                 continue  # pipeline sem relação com produção
-            linhas.append({
-                "projeto": project.path_with_namespace,
+            res["linhas"].append({
+                "projeto": path,
                 "pipeline_id": p["id"],
                 "url": p["web_url"],
                 "ref": p["ref"],
@@ -172,9 +236,8 @@ def processar_projeto(gl, ref_projeto, args, deploy_jobs, rollback_re, gap_auto)
                 "mes": p["created_at"][:7],
                 **a,
             })
-            if i % 100 == 0:
-                print(f"  {i}/{len(pipelines)}", file=sys.stderr)
-    return linhas, erros
+    res["status"] = "com_producao" if res["linhas"] else "sem_jobs_producao"
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +249,14 @@ def main():
                     default=os.getenv("GITLAB_INSECURE", "").lower() in ("1", "true", "yes"),
                     help="desativa a verificação SSL (certificado autoassinado) e suprime os warnings; "
                          "também via GITLAB_INSECURE=1")
-    ap.add_argument("--project", action="append", required=True, help="ID ou path; repetível")
+    ap.add_argument("--project", action="append",
+                    help="ID ou path; repetível. Sem --project/--group, varre o GitLab inteiro")
+    ap.add_argument("--group", help="ID ou path de um grupo (inclui subgrupos)")
+    ap.add_argument("--membership", action="store_true",
+                    help="varredura total: só projetos dos quais o token é membro")
+    ap.add_argument("--include-archived", action="store_true", help="inclui projetos arquivados")
+    ap.add_argument("--all-activity", action="store_true",
+                    help="não filtra projetos por last_activity_at >= --since (mais lento, mais completo)")
     ap.add_argument("--since", type=date.fromisoformat, default=date(2026, 1, 1))
     ap.add_argument("--until", type=date.fromisoformat, default=date(2026, 9, 30))
     ap.add_argument("--deploy-jobs", default="deploy-prd-bc,deploy-prd-mt",
@@ -196,11 +266,14 @@ def main():
     ap.add_argument("--ref", help="filtra por branch/tag (ex.: main)")
     ap.add_argument("--auto-retry-gap", type=int, default=60,
                     help="segundos; retry mais rápido que isso é tratado como automático")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=4, help="threads por projeto (jobs de pipelines)")
+    ap.add_argument("--project-workers", type=int, default=4, help="projetos processados em paralelo")
     ap.add_argument("--out", default=".")
     args = ap.parse_args()
     if not args.url or not args.token:
         ap.error("informe --url/--token ou GITLAB_URL/GITLAB_TOKEN")
+    if args.since > args.until:
+        ap.error("--since não pode ser posterior a --until")
 
     deploy_jobs = [j.strip() for j in args.deploy_jobs.split(",") if j.strip()]
     rollback_re = re.compile(args.rollback_regex)
@@ -208,35 +281,85 @@ def main():
     if args.insecure:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    gl = gitlab.Gitlab(args.url, private_token=args.token, ssl_verify=not args.insecure)
+    gl = gitlab.Gitlab(args.url, private_token=args.token, ssl_verify=not args.insecure,
+                       retry_transient_errors=True, timeout=60)
+
+    try:
+        gl.auth()
+        projetos = listar_projetos(gl, args)
+    except gitlab.exceptions.GitlabAuthenticationError:
+        sys.exit("ERRO: token inválido ou sem o escopo read_api (HTTP 401).")
+    except gitlab.exceptions.GitlabError as e:
+        sys.exit(f"ERRO ao listar projetos: {motivo(e)}")
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"ERRO de conexão com {args.url}: {e}\n(certificado autoassinado? use --insecure ou REQUESTS_CA_BUNDLE)")
+    if not projetos:
+        sys.exit("Nenhum projeto encontrado. Verifique token/permissões, --group, --membership e --all-activity.")
+    print(f"{len(projetos)} projetos a varrer", file=sys.stderr)
 
     linhas, erros = [], []
-    for proj in args.project:
-        l, e = processar_projeto(gl, proj, args, deploy_jobs, rollback_re, gap_auto)
-        linhas += l
-        erros += e
+    contagem, nomes = Counter(), Counter()
+    feitos = 0
+    ex = ThreadPoolExecutor(max_workers=args.project_workers)
+    try:
+        futuros = [ex.submit(processar_projeto, gl, ref, path, args, deploy_jobs, rollback_re, gap_auto)
+                   for ref, path in projetos]
+        for fut in as_completed(futuros):
+            try:
+                r = fut.result()
+            except gitlab.exceptions.GitlabAuthenticationError:
+                print("ERRO: token sem permissão (401) durante a coleta; encerrando com resultados parciais.",
+                      file=sys.stderr)
+                break
+            except Exception as e:  # defesa final: um projeto nunca derruba a execução
+                erros.append(("?", "", f"inesperado: {e}"[:200]))
+                contagem["erro"] += 1
+                continue
+            linhas += r["linhas"]
+            erros += r["erros"]
+            nomes.update(r["nomes"])
+            contagem[r["status"]] += 1
+            feitos += 1
+            if feitos % 50 == 0 or feitos == len(projetos):
+                print(f"  {feitos}/{len(projetos)} projetos | {len(linhas)} pipelines de produção",
+                      file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\nInterrompido: gravando resultados parciais.", file=sys.stderr)
+        for f in futuros:
+            f.cancel()
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
     linhas.sort(key=lambda r: (r["projeto"], r["criado_em"]))
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "pipelines.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(linhas[0].keys()) if linhas else ["vazio"])
+        w = csv.DictWriter(f, fieldnames=CAMPOS_PIPELINE)
         w.writeheader()
         w.writerows(linhas)
+    with open(os.path.join(args.out, "erros.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["projeto", "pipeline_id", "motivo"])
+        w.writerows(erros)
 
     meses = resumir(linhas)
     with open(os.path.join(args.out, "resumo_mensal.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["mes", *COLUNAS_RESUMO, "pct_retry_manual", "pct_rollback"])
-        for mes in sorted(k for k in meses if k != "TOTAL") + ["TOTAL"]:
+        for mes in sorted(k for k in meses if k != "TOTAL") + (["TOTAL"] if meses else []):
             m = meses[mes]
             rb = m["primeira_com_rollback"] + m["retry_manual_com_rollback"]
             rm = m["retry_manual"] + m["retry_manual_com_rollback"]
             w.writerow([mes, *[m[c] for c in COLUNAS_RESUMO],
                         pct(rm, m["deploys_completos"]), pct(rb, m["deploys_completos"])])
 
-    t = meses["TOTAL"]
+    t = meses["TOTAL"]  # defaultdict: zerado se não houve nada
     n = t["deploys_completos"]
     print(f"\nPeríodo {args.since} a {args.until} | deploy completo = {' + '.join(deploy_jobs)}")
+    print(f"Projetos: {len(projetos)} listados | {contagem['com_producao']} com deploy/rollback | "
+          f"{contagem['sem_pipelines']} sem pipelines no período | "
+          f"{contagem['sem_jobs_producao']} sem jobs de produção | "
+          f"{contagem['sem_acesso']} sem acesso/CI desabilitado | {contagem['erro']} com erro")
     print(f"Deploys completos ........ {n}")
     print(f"  entregues de primeira .. {t['primeira'] + t['primeira_com_rollback']}"
           f"  (com rollback: {t['primeira_com_rollback']})")
@@ -245,11 +368,21 @@ def main():
     print(f"    retries após sucesso . {t['retries_apos_sucesso']} de {t['retries_manuais']} retries manuais")
     print(f"Rollbacks únicos ......... {t['rollbacks_unicos']}"
           f"  (sem deploy completo: {t['rollbacks_sem_deploy_completo']}, falhos: {t['rollbacks_falhos']})")
-    print(f"\nArquivos em {os.path.abspath(args.out)}: pipelines.csv, resumo_mensal.csv")
+    print(f"\nArquivos em {os.path.abspath(args.out)}: pipelines.csv, resumo_mensal.csv, erros.csv")
+
+    if n == 0:
+        print("\nNenhum deploy completo encontrado. Confira os nomes dos jobs (--deploy-jobs / --rollback-regex).",
+              file=sys.stderr)
+        if nomes:
+            print("Jobs com 'deploy'/'rollback' no nome vistos nos pipelines (mais frequentes):", file=sys.stderr)
+            for nome, qtd in nomes.most_common(15):
+                print(f"  {qtd:>6}  {nome}", file=sys.stderr)
+        else:
+            print("Nenhum job com 'deploy'/'rollback' no nome foi visto. Verifique período, --ref e permissões.",
+                  file=sys.stderr)
     if erros:
-        print(f"\nATENÇÃO: {len(erros)} pipelines com erro de coleta (não contabilizados):", file=sys.stderr)
-        for e in erros[:10]:
-            print("  ", e, file=sys.stderr)
+        print(f"\nATENÇÃO: {len(erros)} ocorrências de erro/acesso (detalhes em erros.csv); "
+              "pipelines com erro de coleta não foram contabilizados.", file=sys.stderr)
 
 
 if __name__ == "__main__":

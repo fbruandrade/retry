@@ -29,16 +29,24 @@ pip install -r requirements.txt
 export GITLAB_URL=https://gitlab.suaempresa.com.br
 export GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
 
-python deploy_metrics.py --project 123 --out ./saida
+python deploy_metrics.py --out ./saida          # varre TODOS os projetos do GitLab
 ```
+
+Sem `--project` nem `--group`, o script lista todos os projetos visíveis ao token (não arquivados e com atividade desde `--since`), consulta os pipelines do período em cada um e ignora os que não têm jobs de produção. Um token de administrador enxerga a instância inteira; com token comum, só os projetos que ele alcança. Projetos sem permissão, com CI desabilitado, sem pipelines ou com erro de API são registrados e a varredura continua.
 
 Padrões: período `2026-01-01` a `2026-09-30`, jobs `deploy-prd-bc,deploy-prd-mt`.
 
 ### Exemplos
 
 ```bash
-# Vários projetos (ID numérico ou path), somente a branch main
+# Só um grupo (inclui subgrupos)
+python deploy_metrics.py --group plataforma/pagamentos
+
+# Vários projetos específicos (ID numérico ou path), somente a branch main
 python deploy_metrics.py --project 123 --project grupo/app-b --ref main
+
+# Varredura total mais completa (não descarta projetos pela última atividade) e mais rápida
+python deploy_metrics.py --all-activity --project-workers 8
 
 # Outro período
 python deploy_metrics.py --project 123 --since 2026-04-01 --until 2026-06-30
@@ -70,13 +78,18 @@ export REQUESTS_CA_BUNDLE=/caminho/ca-interna.pem
 |---|---|---|
 | `--url` | `$GITLAB_URL` | URL do GitLab |
 | `--token` | `$GITLAB_TOKEN` | Token com `read_api` |
-| `--project` | (obrigatório) | ID ou path do projeto; repetível |
+| `--project` | (todos) | ID ou path do projeto; repetível. Sem `--project`/`--group`, varre o GitLab todo |
+| `--group` | (nenhum) | ID ou path de um grupo, incluindo subgrupos |
+| `--membership` | desligado | Na varredura total, só projetos dos quais o token é membro |
+| `--include-archived` | desligado | Inclui projetos arquivados |
+| `--all-activity` | desligado | Não filtra projetos por `last_activity_at >= --since` (mais lento, mais completo) |
 | `--since` / `--until` | `2026-01-01` / `2026-09-30` | Período, formato `AAAA-MM-DD`, inclusivo, pela data de **criação do pipeline** |
 | `--deploy-jobs` | `deploy-prd-bc,deploy-prd-mt` | Jobs que, juntos, definem um deploy completo |
 | `--rollback-regex` | `^rollback` | Regex dos jobs de rollback |
 | `--ref` | (todas) | Filtra por branch/tag |
 | `--auto-retry-gap` | `60` | Segundos; retry mais rápido que isso é tratado como automático |
-| `--workers` | `8` | Threads de coleta (uma chamada de jobs por pipeline) |
+| `--workers` | `4` | Threads por projeto (uma chamada de jobs por pipeline) |
+| `--project-workers` | `4` | Projetos processados em paralelo |
 | `--insecure` | desligado | Desativa verificação SSL e suprime warnings (`GITLAB_INSECURE=1`) |
 | `--out` | `.` | Diretório de saída |
 
@@ -85,10 +98,12 @@ export REQUESTS_CA_BUNDLE=/caminho/ca-interna.pem
 Em `--out`:
 
 - **`pipelines.csv`**: uma linha por pipeline relevante (com deploy ou rollback): projeto, id, URL, ref, mês, `deploy_completo`, `entrega` (`primeira`/`retry_manual`), `retries_manuais`, `retries_apos_sucesso`, `rollback` (`success`/`failed`/`none`). Serve para auditar cada caso pelo link.
+- **`erros.csv`**: projetos sem acesso/CI desabilitado/erro de API e pipelines cujos jobs não puderam ser lidos (projeto, pipeline, motivo).
 - **`resumo_mensal.csv`**: totais por mês e linha `TOTAL`, com os quatro grupos do cruzamento, `rollbacks_unicos`, `rollbacks_sem_deploy_completo`, `rollbacks_falhos`, `pct_retry_manual` e `pct_rollback`.
 - Resumo no terminal:
 
 ```
+Projetos: N listados | N com deploy/rollback | N sem pipelines no período | N sem jobs de produção | N sem acesso/CI desabilitado | N com erro
 Deploys completos ........ N
   entregues de primeira .. N  (com rollback: N)
   com retry manual ....... N  (com rollback: N)
@@ -108,9 +123,11 @@ A API do GitLab **não informa** se um retry foi manual ou automático. Cada ret
 
 ## Limitações e cuidados
 
-- **Desempenho:** uma chamada de jobs por pipeline. Em milhares de pipelines pode demorar; use `--ref`, reduza o período ou ajuste `--workers`.
+- **Desempenho:** uma chamada de jobs por pipeline. Em instâncias grandes a varredura total pode levar horas; use `--group`, `--ref`, reduza o período ou ajuste `--workers`/`--project-workers` (cuidado com o rate limit do servidor).
 - **Retenção:** pipelines/jobs removidos por política de expiração não aparecem.
-- **Erros de coleta:** pipelines que falharem na API são listados ao final (stderr) e **não entram** na contagem.
+- **Erros de coleta:** nada derruba a execução, exceto token inválido (401), que encerra com mensagem clara. Falhas por projeto ou pipeline vão para `erros.csv` e **não entram** na contagem. Erros transitórios (429/5xx) são repetidos automaticamente. `Ctrl+C` grava os resultados parciais.
+- **Nada encontrado:** se não houver nenhum deploy completo, o script lista os nomes de job com `deploy`/`rollback` que viu, para você ajustar `--deploy-jobs` e `--rollback-regex`.
+- **Filtro por atividade:** na varredura total, projetos sem atividade desde `--since` são descartados. Um projeto que só roda por agendamento, sem commits no período, seria perdido; use `--all-activity` nesse caso.
 - **Rollback sem deploy completo:** reportado à parte. É possível reverter um deploy que entregou em apenas um dos clusters.
 - **Última tentativa:** um deploy que teve sucesso e depois foi reexecutado com falha conta como **não completo**.
 - **Nomes de rollback:** se o regex for amplo demais, pode capturar jobs que não são rollback; confira em `pipelines.csv`.
