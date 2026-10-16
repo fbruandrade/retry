@@ -23,10 +23,12 @@ import argparse
 import csv
 import os
 import re
+import statistics
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import gitlab
 import requests
@@ -88,9 +90,15 @@ def analisar_pipeline(jobs, deploy_jobs, rollback_re, gap_auto):
     else:
         rollback = "none"
 
+    deploy_em = ""
+    if deploy_completo:
+        fins = [parse_ts(por_job[n][-1].get("finished_at") or por_job[n][-1]["created_at"]) for n in deploy_jobs]
+        deploy_em = max(fins).isoformat()
+
     return {
         "deploy_presente": deploy_presente,
         "deploy_completo": deploy_completo,
+        "deploy_em": deploy_em,
         "retries_manuais": retries_manuais,
         "retries_apos_sucesso": retries_apos_sucesso,
         "entrega": "retry_manual" if retries_manuais else "primeira",
@@ -132,13 +140,86 @@ def pct(a, b):
     return f"{100 * a / b:.1f}" if b else "0.0"
 
 
+GITLAB_TODO = "(GITLAB TODO)"
+
+
+def grupos_do_projeto(path):
+    """'a/b/c/proj' -> ['a', 'a/b', 'a/b/c']  (rollup em cascata, subgrupos incluídos)."""
+    partes = path.split("/")[:-1]
+    return ["/".join(partes[:i]) for i in range(1, len(partes) + 1)]
+
+
+def classificar_dora(deploys_por_dia):
+    """Aproximação das faixas DORA de frequência de deploy (média no período)."""
+    if deploys_por_dia > 1:
+        return "Elite (várias vezes por dia)"
+    if deploys_por_dia >= 1 / 7:
+        return "Alto (entre 1/dia e 1/semana)"
+    if deploys_por_dia >= 1 / 30:
+        return "Médio (entre 1/semana e 1/mês)"
+    return "Baixo (menos de 1/mês)" if deploys_por_dia > 0 else "Sem deploys"
+
+
+def calcular_frequencia(linhas, since, until, tz, sem_revertidos=False):
+    """Frequência de deploy por grupo (cascata) e para o GitLab todo.
+
+    Retorna (resumo, semanal): listas de dicts. Usa a data real do deploy
+    (deploy_em), no fuso `tz`, limitada a [since, until].
+    """
+    dias_periodo = (until - since).days + 1
+    escopos = defaultdict(list)  # escopo -> [(datetime, revertido, projeto)]
+    for r in linhas:
+        if not r["deploy_completo"] or not r["deploy_em"]:
+            continue
+        dt = parse_ts(r["deploy_em"]).astimezone(tz)
+        if not (since <= dt.date() <= until):
+            continue
+        revertido = r["rollback"] == "success"
+        if sem_revertidos and revertido:
+            continue
+        item = (dt, revertido, r["projeto"])
+        escopos[GITLAB_TODO].append(item)
+        for g in grupos_do_projeto(r["projeto"]):
+            escopos[g].append(item)
+
+    total_semanas = len({(since + timedelta(days=i)).isocalendar()[:2] for i in range(dias_periodo)})
+    resumo, semanal = [], []
+    for escopo, itens in escopos.items():
+        itens.sort(key=lambda x: x[0])
+        datas = [i[0] for i in itens]
+        n = len(itens)
+        por_semana = Counter("%d-W%02d" % i[0].isocalendar()[:2] for i in itens)
+        intervalos = [(b - a).total_seconds() / 3600 for a, b in zip(datas, datas[1:])]
+        por_dia = n / dias_periodo
+        resumo.append({
+            "escopo": escopo,
+            "nivel": 0 if escopo == GITLAB_TODO else escopo.count("/") + 1,
+            "deploys": n,
+            "deploys_revertidos": sum(1 for i in itens if i[1]),
+            "deploys_mantidos": sum(1 for i in itens if not i[1]),
+            "projetos_com_deploy": len({i[2] for i in itens}),
+            "dias_com_deploy": len({d.date() for d in datas}),
+            "dias_periodo": dias_periodo,
+            "deploys_por_dia": f"{por_dia:.3f}",
+            "deploys_por_semana": f"{por_dia * 7:.2f}",
+            "pct_semanas_com_deploy": pct(len(por_semana), total_semanas),
+            "intervalo_mediano_horas": f"{statistics.median(intervalos):.1f}" if intervalos else "",
+            "classificacao_dora": classificar_dora(por_dia),
+        })
+        for sem, qtd in sorted(por_semana.items()):
+            semanal.append({"escopo": escopo, "semana": sem, "deploys": qtd})
+    resumo.sort(key=lambda r: (r["nivel"], -r["deploys"], r["escopo"]))
+    semanal.sort(key=lambda r: (r["escopo"], r["semana"]))
+    return resumo, semanal
+
+
 
 # --------------------------------------------------------------------------
 # Coleta no GitLab
 # --------------------------------------------------------------------------
 CAMPOS_PIPELINE = [
     "projeto", "pipeline_id", "url", "ref", "criado_em", "mes",
-    "deploy_presente", "deploy_completo", "entrega",
+    "deploy_presente", "deploy_completo", "deploy_em", "entrega",
     "retries_manuais", "retries_apos_sucesso", "rollback",
 ]
 NOMES_RELEVANTES = re.compile(r"deploy|rollback|revert", re.I)
@@ -266,6 +347,9 @@ def main():
     ap.add_argument("--ref", help="filtra por branch/tag (ex.: main)")
     ap.add_argument("--auto-retry-gap", type=int, default=60,
                     help="segundos; retry mais rápido que isso é tratado como automático")
+    ap.add_argument("--tz", default="America/Sao_Paulo", help="fuso para datas/semanas da frequência de deploy")
+    ap.add_argument("--sem-revertidos", action="store_true",
+                    help="frequência: exclui deploys seguidos de rollback (padrão: inclui, com coluna separada)")
     ap.add_argument("--workers", type=int, default=4, help="threads por projeto (jobs de pipelines)")
     ap.add_argument("--project-workers", type=int, default=4, help="projetos processados em paralelo")
     ap.add_argument("--out", default=".")
@@ -353,6 +437,21 @@ def main():
             w.writerow([mes, *[m[c] for c in COLUNAS_RESUMO],
                         pct(rm, m["deploys_completos"]), pct(rb, m["deploys_completos"])])
 
+    try:
+        tz = ZoneInfo(args.tz)
+    except ZoneInfoNotFoundError:
+        print(f"Fuso '{args.tz}' não encontrado; usando UTC.", file=sys.stderr)
+        tz = timezone.utc
+    freq, semanal = calcular_frequencia(linhas, args.since, args.until, tz, args.sem_revertidos)
+    for nome, dados in (("frequencia_deploy.csv", freq), ("frequencia_semanal.csv", semanal)):
+        with open(os.path.join(args.out, nome), "w", newline="") as f:
+            if dados:
+                w = csv.DictWriter(f, fieldnames=list(dados[0].keys()))
+                w.writeheader()
+                w.writerows(dados)
+            else:
+                f.write("sem_deploys_no_periodo\n")
+
     t = meses["TOTAL"]  # defaultdict: zerado se não houve nada
     n = t["deploys_completos"]
     print(f"\nPeríodo {args.since} a {args.until} | deploy completo = {' + '.join(deploy_jobs)}")
@@ -368,7 +467,14 @@ def main():
     print(f"    retries após sucesso . {t['retries_apos_sucesso']} de {t['retries_manuais']} retries manuais")
     print(f"Rollbacks únicos ......... {t['rollbacks_unicos']}"
           f"  (sem deploy completo: {t['rollbacks_sem_deploy_completo']}, falhos: {t['rollbacks_falhos']})")
-    print(f"\nArquivos em {os.path.abspath(args.out)}: pipelines.csv, resumo_mensal.csv, erros.csv")
+    if freq:
+        print("\nFrequência de deploy (grupos de 1º nível, por volume):")
+        print(f"  {'escopo':<32}{'deploys':>8}{'/semana':>9}{'mediana(h)':>12}  DORA")
+        for r in [x for x in freq if x["nivel"] <= 1][:15]:
+            print(f"  {r['escopo']:<32}{r['deploys']:>8}{r['deploys_por_semana']:>9}"
+                  f"{r['intervalo_mediano_horas'] or '-':>12}  {r['classificacao_dora']}")
+    print(f"\nArquivos em {os.path.abspath(args.out)}: pipelines.csv, resumo_mensal.csv, "
+          "frequencia_deploy.csv, frequencia_semanal.csv, erros.csv")
 
     if n == 0:
         print("\nNenhum deploy completo encontrado. Confira os nomes dos jobs (--deploy-jobs / --rollback-regex).",

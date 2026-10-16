@@ -10,6 +10,7 @@ Para cada pipeline do período, o script calcula:
 | **Rollback único** | Um ou mais jobs cujo nome casa com `--rollback-regex` (padrão `^rollback`) com `success`. Vários jobs de rollback no mesmo pipeline (um por cluster) contam como **1**. |
 | **Entrega de primeira** | Deploy completo sem retry manual nos jobs de deploy. |
 | **Entrega com retry manual** | Deploy completo com pelo menos um retry manual, **mesmo que a tentativa anterior tenha dado sucesso**. |
+| **Frequência de deploy** | Deploys completos por grupo e para o GitLab todo, usando a **data real do deploy** (`finished_at` do último job de deploy concluído), no fuso `--tz`. Detalhes na seção própria abaixo. |
 | **Cruzamento** | Cada deploy completo cai em um de quatro grupos: `primeira`, `primeira_com_rollback`, `retry_manual`, `retry_manual_com_rollback`. |
 
 ## Requisitos
@@ -91,6 +92,8 @@ export REQUESTS_CA_BUNDLE=/caminho/ca-interna.pem
 | `--workers` | `4` | Threads por projeto (uma chamada de jobs por pipeline) |
 | `--project-workers` | `4` | Projetos processados em paralelo |
 | `--insecure` | desligado | Desativa verificação SSL e suprime warnings (`GITLAB_INSECURE=1`) |
+| `--tz` | `America/Sao_Paulo` | Fuso para datas e semanas da frequência de deploy |
+| `--sem-revertidos` | desligado | Frequência: exclui deploys seguidos de rollback |
 | `--out` | `.` | Diretório de saída |
 
 ## Saídas
@@ -98,6 +101,8 @@ export REQUESTS_CA_BUNDLE=/caminho/ca-interna.pem
 Em `--out`:
 
 - **`pipelines.csv`**: uma linha por pipeline relevante (com deploy ou rollback): projeto, id, URL, ref, mês, `deploy_completo`, `entrega` (`primeira`/`retry_manual`), `retries_manuais`, `retries_apos_sucesso`, `rollback` (`success`/`failed`/`none`). Serve para auditar cada caso pelo link.
+- **`frequencia_deploy.csv`**: frequência de deploy por escopo (ver abaixo).
+- **`frequencia_semanal.csv`**: deploys por semana ISO (`AAAA-Www`) e por escopo, para gráficos de tendência. Semanas sem deploy não aparecem.
 - **`erros.csv`**: projetos sem acesso/CI desabilitado/erro de API e pipelines cujos jobs não puderam ser lidos (projeto, pipeline, motivo).
 - **`resumo_mensal.csv`**: totais por mês e linha `TOTAL`, com os quatro grupos do cruzamento, `rollbacks_unicos`, `rollbacks_sem_deploy_completo`, `rollbacks_falhos`, `pct_retry_manual` e `pct_rollback`.
 - Resumo no terminal:
@@ -110,6 +115,27 @@ Deploys completos ........ N
     retries após sucesso . N de N retries manuais
 Rollbacks únicos ......... N  (sem deploy completo: N, falhos: N)
 ```
+
+## Frequência de deploy por grupo e no GitLab todo
+
+`frequencia_deploy.csv` tem uma linha por escopo: `(GITLAB TODO)` (nível 0) e cada grupo/subgrupo (nível 1, 2, ...). O cálculo é em cascata: um deploy em `pay/core/api` conta em `pay` e em `pay/core`. Projetos fora de grupos (namespaces de usuário) aparecem como um grupo com o nome do usuário.
+
+| Coluna | Significado |
+|---|---|
+| `deploys` | Deploys completos no período |
+| `deploys_revertidos` / `deploys_mantidos` | Quantos tiveram rollback no mesmo pipeline e quantos não |
+| `projetos_com_deploy` | Projetos distintos que entregaram |
+| `dias_com_deploy` | Dias distintos com ao menos um deploy |
+| `deploys_por_dia` / `deploys_por_semana` | `deploys / dias corridos do período` |
+| `pct_semanas_com_deploy` | Consistência: % das semanas do período com pelo menos um deploy |
+| `intervalo_mediano_horas` | Mediana do tempo entre deploys consecutivos |
+| `classificacao_dora` | Faixa pela média do período |
+
+Faixas (aproximação das métricas DORA, sobre dias corridos): **Elite** > 1 deploy/dia; **Alto** entre 1/dia e 1/semana; **Médio** entre 1/semana e 1/mês; **Baixo** menos de 1/mês.
+
+- Só entram deploys completos cuja data real caiu entre `--since` e `--until`. Um pipeline criado antes de `--since` e concluído dentro do período não é coletado, porque a busca de pipelines usa a data de criação.
+- Por padrão, deploys revertidos contam. Use `--sem-revertidos` para medir só o que ficou em produção.
+- A média por dia usa o período todo como denominador. Em grupos que começaram a entregar no meio do período, a frequência fica subestimada; compare com `frequencia_semanal.csv`.
 
 ## Como o retry manual é identificado
 
